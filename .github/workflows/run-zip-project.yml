@@ -1,246 +1,198 @@
 
-name: E-Commerce Pro Ultimate - ZIP Runner
+name: E-Commerce Pro Ultimate - Build and Deploy
 
 on:
   push:
     paths:
       - "*.zip"
-      - "project.zip"
       - ".github/workflows/run-zip-project.yml"
-
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ecommerce-zip-${{ github.ref }}
+  group: ecommerce-pages
   cancel-in-progress: true
 
 jobs:
-  run-project:
-    name: Extract, Install, Build and Validate
+  build:
+    name: Extract, Build and Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    permissions:
+      contents: read
+
     steps:
-      # 1. Download repository contents
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Find project ZIP
       - name: Find ZIP archive
         shell: bash
         run: |
           set -e
 
-          if [ -f "project.zip" ]; then
-            ZIP_FILE="project.zip"
+          if [ -f project.zip ]; then
+            ZIP_FILE=project.zip
           else
-            mapfile -t ZIP_FILES < <(
-              find . -maxdepth 1 -type f -iname "*.zip" | sort
-            )
+            mapfile -t FILES < <(find . -maxdepth 1 -iname "*.zip" -type f)
 
-            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
-              echo "::error::No ZIP archive found in repository root."
-              echo "Please upload project.zip to the repository root."
-              echo "Repository files:"
-              ls -la
+            if [ "${#FILES[@]}" -ne 1 ]; then
+              echo "::error::Upload exactly one ZIP file or name it project.zip"
               exit 1
             fi
 
-            if [ "${#ZIP_FILES[@]}" -gt 1 ]; then
-              echo "::error::Multiple ZIP archives found."
-              echo "Keep only one ZIP or rename the required archive to project.zip."
-              printf '%s\n' "${ZIP_FILES[@]}"
-              exit 1
-            fi
-
-            ZIP_FILE="${ZIP_FILES[0]}"
+            ZIP_FILE="${FILES[0]}"
           fi
 
           echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
-          echo "Selected archive: $ZIP_FILE"
 
-      # 3. Validate ZIP archive
-      - name: Validate ZIP archive
+      - name: Validate and extract ZIP
         run: |
           set -e
           unzip -t "$ZIP_FILE"
-          echo "ZIP archive is valid."
-
-      # 4. Extract project
-      - name: Extract project
-        run: |
-          set -e
-          mkdir -p extracted
+          mkdir extracted
           unzip -q "$ZIP_FILE" -d extracted
-          echo "Project extracted successfully."
 
-      # 5. Locate package.json
-      - name: Locate application
+      - name: Locate project
         shell: bash
         run: |
           set -e
 
-          mapfile -t PACKAGE_FILES < <(
-            find extracted \
-              -maxdepth 6 \
-              -type f \
-              -name package.json \
-              -not -path "*/node_modules/*" \
-              | sort
+          mapfile -t FILES < <(
+            find extracted -maxdepth 6 -name package.json \
+              -not -path "*/node_modules/*" -type f | sort
           )
 
-          if [ "${#PACKAGE_FILES[@]}" -eq 0 ]; then
-            echo "::error::package.json not found inside ZIP."
-            find extracted -maxdepth 4 -type f | head -100
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::package.json not found"
             exit 1
           fi
 
-          echo "Found package.json files:"
-          printf '%s\n' "${PACKAGE_FILES[@]}"
-
-          PROJECT_DIR=$(dirname "${PACKAGE_FILES[0]}")
-
+          PROJECT_DIR=$(dirname "${FILES[0]}")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Selected project: $PROJECT_DIR"
 
-      # 6. Setup Node.js
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          echo "REPO_NAME=$REPO_NAME" >> "$GITHUB_ENV"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
-      # 7. Install dependencies
+      - name: Configure GitHub Pages base path
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          repo = os.environ["REPO_NAME"]
+          base = f"/{repo}/"
+
+          vite = Path("vite.config.ts")
+          content = vite.read_text()
+
+          if "base:" not in content:
+              content = content.replace(
+                  "export default defineConfig({",
+                  f'export default defineConfig({{\n  base: "{base}",',
+                  1
+              )
+              vite.write_text(content)
+
+          main = Path("src/main.tsx")
+          content = main.read_text()
+
+          old = 'const prefix = window.location.pathname.match(/^\\/(en|fr|ar)(?=\\/|$)/)?.[0] ?? "";'
+          new = '''const basePath = import.meta.env.BASE_URL.replace(/\\/$/, "");
+          const relativePath = window.location.pathname.startsWith(basePath)
+            ? window.location.pathname.slice(basePath.length)
+            : window.location.pathname;
+          const prefix = relativePath.match(/^\\/(en|fr|ar)(?=\\/|$)/)?.[0] ?? "";
+          const routerBase = `${basePath}${prefix}`;'''
+
+          if old in content:
+              content = content.replace(old, new)
+              content = content.replace(
+                  '<BrowserRouter basename={prefix}>',
+                  '<BrowserRouter basename={routerBase}>'
+              )
+              main.write_text(content)
+
+          html = Path("index.html")
+          content = html.read_text()
+          content = content.replace(
+              'href="/manifest.webmanifest"',
+              'href="%BASE_URL%manifest.webmanifest"'
+          )
+          content = content.replace(
+              'href="/icon.svg"',
+              'href="%BASE_URL%icon.svg"'
+          )
+          html.write_text(content)
+
+          print("GitHub Pages base path configured:", base)
+          PY
+
       - name: Install dependencies
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
         run: |
-          set -e
-
           if [ -f package-lock.json ]; then
             npm ci --no-audit --no-fund
           else
             npm install --no-audit --no-fund
           fi
 
-      # 8. Verify package scripts
-      - name: Inspect package scripts
-        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
-        run: |
-          node -e "
-            const p = require('./package.json');
-            console.log(JSON.stringify(p.scripts || {}, null, 2));
-          "
-
-      # 9. TypeScript check when available
       - name: TypeScript validation
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -e
+        run: npm run typecheck
 
-          if node -e "
-            const p = require('./package.json');
-            process.exit(p.scripts?.typecheck ? 0 : 1);
-          "; then
-            npm run typecheck
-          else
-            echo "No typecheck script configured. Skipping."
-          fi
-
-      # 10. Build application
       - name: Build application
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
-        run: |
-          set -e
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: npm run build
 
-          node -e "
-            const p = require('./package.json');
-            if (!p.scripts?.build) {
-              console.error('Build script is missing!');
-              process.exit(1);
-            }
-          "
-
-          npm run build
-
-      # 11. Check build output
-      - name: Verify build output
+      - name: Verify build
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
         run: |
-          set -e
+          test -f dist/index.html
+          echo "Build output verified."
+          du -sh dist
 
-          if [ -d dist ]; then
-            echo "Vite build output found."
-            du -sh dist
-          elif [ -d build ]; then
-            echo "Build output found."
-            du -sh build
-          else
-            echo "::error::Build completed but dist/build folder was not found."
-            exit 1
-          fi
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
-      # 12. Check Supabase migrations
-      - name: Validate Supabase migrations
-        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
-        run: |
-          set -e
-
-          if [ -d supabase/migrations ]; then
-            COUNT=$(find supabase/migrations \
-              -maxdepth 1 -type f -name "*.sql" | wc -l)
-
-            echo "SQL migrations: $COUNT"
-
-            if [ "$COUNT" -eq 0 ]; then
-              echo "::error::No SQL migrations found."
-              exit 1
-            fi
-          else
-            echo "Supabase migrations folder not found."
-          fi
-
-      # 13. Check Supabase Edge Functions
-      - name: Validate Edge Functions
-        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
-        run: |
-          set -e
-
-          if [ -d supabase/functions ]; then
-            COUNT=$(find supabase/functions \
-              -type f -name "index.ts" | wc -l)
-
-            echo "Edge Functions found: $COUNT"
-          else
-            echo "Supabase Edge Functions folder not found."
-          fi
-
-      # 14. Upload build artifacts
-      - name: Upload build artifact
-        if: success()
-        uses: actions/upload-artifact@v4
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: ecommerce-pro-build
-          path: |
-            ${{ env.PROJECT_DIR }}/dist
-            ${{ env.PROJECT_DIR }}/build
-          if-no-files-found: warn
-          retention-days: 7
+          path: ${{ env.PROJECT_DIR }}/dist
 
-      # 15. Final report
-      - name: Final report
-        if: always()
+  deploy:
+    name: Publish Website
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Display website URL
         run: |
-          echo "================================"
-          echo "E-COMMERCE PRO ULTIMATE"
-          echo "================================"
-          echo "ZIP extraction: completed if previous step passed"
-          echo "Dependency installation: check logs"
-          echo "TypeScript validation: check logs"
-          echo "Application build: check logs"
-          echo "Supabase structure: check logs"
-          echo "Remote database tests: not executed"
-          echo "Stripe integration: not executed"
-          echo "================================"
+          echo "## E-Commerce Pro Ultimate" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Website successfully published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Open your website](${{ steps.deployment.outputs.page_url }})" >> "$GITHUB_STEP_SUMMARY"
