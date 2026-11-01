@@ -1,0 +1,121 @@
+
+name: Run ZIP Project - E-Commerce Pro Ultimate
+
+on:
+  push:
+    paths:
+      - "project.zip"
+      - ".github/workflows/run-zip-project.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-project:
+    name: Extract, Install and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify ZIP file
+        run: |
+          if [ ! -f "project.zip" ]; then
+            echo "ERROR: project.zip was not found!"
+            exit 1
+          fi
+
+      - name: Extract project ZIP
+        run: |
+          mkdir -p extracted
+          unzip -q project.zip -d extracted
+          echo "ZIP extracted successfully."
+
+      - name: Locate project
+        run: |
+          if [ -f "extracted/package.json" ]; then
+            PROJECT_DIR="extracted"
+          else
+            PROJECT_DIR=$(find extracted -mindepth 2 -maxdepth 4 \
+              -name package.json -type f -print -quit \
+              | xargs -r dirname)
+          fi
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/package.json" ]; then
+            echo "ERROR: package.json not found in ZIP."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project located: $PROJECT_DIR"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Check project scripts
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: npm run
+
+      - name: Build application
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: |
+          npm run build
+
+      - name: TypeScript validation
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: |
+          node -e "
+            const p = require('./package.json');
+            process.exit(p.scripts?.typecheck ? 0 : 1);
+          " && npm run typecheck || {
+            echo "No separate typecheck script found."
+          }
+
+      - name: Check Supabase migrations
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: |
+          if [ -d supabase/migrations ]; then
+            COUNT=$(find supabase/migrations -maxdepth 1 -name '*.sql' -type f | wc -l)
+            echo "SQL migrations found: $COUNT"
+            test "$COUNT" -gt 0
+          else
+            echo "WARNING: Supabase migrations folder not found."
+          fi
+
+      - name: Check Supabase Edge Functions
+        working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
+        run: |
+          if [ -d supabase/functions ]; then
+            COUNT=$(find supabase/functions -name index.ts -type f | wc -l)
+            echo "Edge Functions found: $COUNT"
+          else
+            echo "WARNING: Edge Functions folder not found."
+          fi
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecommerce-build
+          path: |
+            ${{ env.PROJECT_DIR }}/dist
+          if-no-files-found: warn
+
+      - name: Final report
+        if: always()
+        run: |
+          echo "ZIP project workflow finished."
+          echo "Check the previous steps for errors."
