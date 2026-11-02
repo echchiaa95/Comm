@@ -21,9 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    permissions:
-      contents: read
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,20 +29,16 @@ jobs:
         shell: bash
         run: |
           set -e
-
           if [ -f project.zip ]; then
             ZIP_FILE=project.zip
           else
             mapfile -t FILES < <(find . -maxdepth 1 -iname "*.zip" -type f)
-
             if [ "${#FILES[@]}" -ne 1 ]; then
-              echo "::error::Upload exactly one ZIP file or name it project.zip"
+              echo "::error::Upload exactly one ZIP file."
               exit 1
             fi
-
             ZIP_FILE="${FILES[0]}"
           fi
-
           echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
       - name: Validate and extract ZIP
@@ -59,38 +52,31 @@ jobs:
         shell: bash
         run: |
           set -e
-
           mapfile -t FILES < <(
             find extracted -maxdepth 6 -name package.json \
               -not -path "*/node_modules/*" -type f | sort
           )
-
           if [ "${#FILES[@]}" -eq 0 ]; then
             echo "::error::package.json not found"
             exit 1
           fi
-
           PROJECT_DIR=$(dirname "${FILES[0]}")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          echo "REPO_NAME=$REPO_NAME" >> "$GITHUB_ENV"
+          echo "REPO_NAME=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_ENV"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Configure GitHub Pages base path
+      - name: Configure GitHub Pages
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import os
 
-          repo = os.environ["REPO_NAME"]
-          base = f"/{repo}/"
-
+          base = f"/{os.environ['REPO_NAME']}/"
           vite = Path("vite.config.ts")
           content = vite.read_text()
 
@@ -103,37 +89,24 @@ jobs:
               vite.write_text(content)
 
           main = Path("src/main.tsx")
-          content = main.read_text()
-
-          old = 'const prefix = window.location.pathname.match(/^\\/(en|fr|ar)(?=\\/|$)/)?.[0] ?? "";'
-          new = '''const basePath = import.meta.env.BASE_URL.replace(/\\/$/, "");
+          if main.exists():
+              content = main.read_text()
+              content = content.replace(
+                  'const prefix = window.location.pathname.match(/^\\/(en|fr|ar)(?=\\/|$)/)?.[0] ?? "";',
+                  '''const basePath = import.meta.env.BASE_URL.replace(/\\/$/, "");
           const relativePath = window.location.pathname.startsWith(basePath)
             ? window.location.pathname.slice(basePath.length)
             : window.location.pathname;
           const prefix = relativePath.match(/^\\/(en|fr|ar)(?=\\/|$)/)?.[0] ?? "";
           const routerBase = `${basePath}${prefix}`;'''
-
-          if old in content:
-              content = content.replace(old, new)
+              )
               content = content.replace(
                   '<BrowserRouter basename={prefix}>',
                   '<BrowserRouter basename={routerBase}>'
               )
               main.write_text(content)
 
-          html = Path("index.html")
-          content = html.read_text()
-          content = content.replace(
-              'href="/manifest.webmanifest"',
-              'href="%BASE_URL%manifest.webmanifest"'
-          )
-          content = content.replace(
-              'href="/icon.svg"',
-              'href="%BASE_URL%icon.svg"'
-          )
-          html.write_text(content)
-
-          print("GitHub Pages base path configured:", base)
+          print("Configured base:", base)
           PY
 
       - name: Install dependencies
@@ -145,26 +118,26 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: TypeScript validation
+      - name: Validate TypeScript
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
         run: npm run typecheck
 
       - name: Build application
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm run build
 
-      - name: Verify build
+      - name: Prepare GitHub Pages SPA
         working-directory: ${{ github.workspace }}/${{ env.PROJECT_DIR }}
         run: |
+          set -e
           test -f dist/index.html
-          echo "Build output verified."
-          du -sh dist
+          cp dist/index.html dist/404.html
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+          if [ -f dist/manifest.webmanifest ]; then
+            echo "Manifest found."
+          fi
+
+          echo "Build prepared successfully."
 
       - name: Upload website
         uses: actions/upload-pages-artifact@v3
@@ -193,6 +166,4 @@ jobs:
         run: |
           echo "## E-Commerce Pro Ultimate" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Website successfully published" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "[Open your website](${{ steps.deployment.outputs.page_url }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Open Website](${{ steps.deployment.outputs.page_url }})" >> "$GITHUB_STEP_SUMMARY"
